@@ -438,7 +438,7 @@ impl App {
             row![
                 text(format!("{}{}", sender, fwd)).size(14),
                 horizontal_space(),
-                text(&dt).size(12),
+                text(dt.clone()).size(12),
             ]
             .into(),
         ];
@@ -450,7 +450,7 @@ impl App {
             parts.push(text(format!("Links: {}", links.join(" "))).size(12).into());
         }
         if !plain.is_empty() {
-            parts.push(text(&plain).size(14).into());
+            parts.push(text(plain.clone()).size(14).into());
         }
 
         Column::with_children(parts)
