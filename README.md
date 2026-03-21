@@ -57,7 +57,3 @@ cargo build --release
 1. Open **Telegram Desktop** → any chat → `⋮` → **Export chat history**
 2. Choose **JSON** format
 3. Point tgxplorer at the resulting `result.json`
-
-## License
-
-MIT
