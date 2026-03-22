@@ -11,8 +11,10 @@ use iced::widget::{
 use iced::widget::rule;
 use iced::widget::space;
 use iced::widget::text::Wrapping;
-use iced::{clipboard, Element, Length, Task, Theme};
+use iced::{clipboard, Color, Element, Length, Task, Theme};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 fn main() -> iced::Result {
@@ -195,6 +197,64 @@ fn content_tag_emoji(tag: &str) -> &'static str {
     }
 }
 
+/// Telegram-style avatar colors (from_rgb8 for exact values).
+const TG_COLORS: [Color; 12] = [
+    Color::from_rgb8(0xFF, 0x6B, 0x6B), // Red
+    Color::from_rgb8(0xFF, 0x9F, 0x4A), // Orange
+    Color::from_rgb8(0xFF, 0xD9, 0x3D), // Yellow
+    Color::from_rgb8(0x6B, 0xCB, 0x77), // Green
+    Color::from_rgb8(0x4D, 0x96, 0xFF), // Light Blue
+    Color::from_rgb8(0x6C, 0x63, 0xFF), // Blue
+    Color::from_rgb8(0xC0, 0x84, 0xFC), // Purple
+    Color::from_rgb8(0xFF, 0x6B, 0x9D), // Pink
+    Color::from_rgb8(0x4E, 0xCD, 0xC4), // Turquoise
+    Color::from_rgb8(0x96, 0xCE, 0xB4), // Lime
+    Color::from_rgb8(0xF4, 0xA2, 0x61), // Peach
+    Color::from_rgb8(0xE9, 0xC4, 0x6A), // Magenta
+];
+
+/// Deterministic color based on name hash (like Telegram).
+fn avatar_color(name: &str) -> Color {
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    let hash = hasher.finish();
+    TG_COLORS[(hash % 12) as usize]
+}
+
+/// First letter uppercase for avatar.
+fn avatar_letter(name: &str) -> String {
+    name.chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into())
+}
+
+/// Build a 26px colored circle avatar with a letter inside.
+fn avatar_circle<'a>(name: &str) -> Element<'a, Msg> {
+    let color = avatar_color(name);
+    let letter = avatar_letter(name);
+    let size: f32 = 26.0;
+    container(
+        text(letter)
+            .size(size * 0.48)
+            .color(Color::WHITE),
+    )
+    .width(size)
+    .height(size)
+    .align_x(iced::alignment::Horizontal::Center)
+    .align_y(iced::alignment::Vertical::Center)
+    .style(move |_theme: &Theme| container::Style {
+        background: Some(color.into()),
+        border: iced::Border {
+            radius: (size / 2.0).into(),
+            width: 0.0,
+            color: Color::TRANSPARENT,
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
@@ -235,7 +295,7 @@ impl App {
         let chains = find_all_chains(&filtered, &dict, self.min_chain_length);
 
         let mut sorted: Vec<Message> = dict.values().cloned().collect();
-        sorted.sort_by(|a, b| b.id.cmp(&a.id));
+        sorted.sort_by(|a, b| a.id.cmp(&b.id)); // oldest first
 
         self.content_stats = ContentStats::from_messages(&dict);
         self.messages = dict;
@@ -288,7 +348,7 @@ impl App {
                     .push((*idx, dt, chain.len()));
             }
         }
-        for (day, mut entries) in by_day.into_iter().rev() {
+        for (day, mut entries) in by_day.into_iter() {
             entries.sort_by_key(|(_, dt, _)| *dt);
             let total_msgs: usize = entries.iter().map(|(_, _, c)| c).sum();
             let chain_indices: Vec<usize> = entries.iter().map(|(i, _, _)| *i).collect();
@@ -325,7 +385,6 @@ impl App {
         }
         let mut keys: Vec<String> = buckets.keys().cloned().collect();
         keys.sort();
-        keys.reverse();
         for k in keys {
             let (label, message_indices, message_count) = buckets.remove(&k).unwrap();
             self.time_groups.push(TimeGroup {
@@ -781,20 +840,28 @@ impl App {
 
         // -- Build parts --
 
-        let mut parts: Vec<Element<'_, Msg>> = vec![
-            rule::horizontal(1).into(),
-            row![
-                text(format!("{}{}", sender, fwd)).size(14),
-                space::horizontal(),
-                text(dt).size(12),
-            ]
-            .into(),
-        ];
+        let mut parts: Vec<Element<'_, Msg>> = vec![rule::horizontal(1).into()];
 
-        // Content type tag: [image], [video], [file <name>], [sticker], etc.
+        // Avatar circle + sender name + timestamp
+        let avatar = avatar_circle(sender);
+        let header = row![
+            avatar,
+            text(format!("{}{}", sender, fwd)).size(14),
+            space::horizontal(),
+            text(dt).size(12),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+        parts.push(header.into());
+
+        // Content type tag -- sticker shows emoji in brackets
         if let Some(tag) = msg.content_tag() {
             let emoji = content_tag_emoji(tag);
             let detail = match tag {
+                "sticker" => {
+                    let se = msg.sticker_emoji.as_deref().unwrap_or("");
+                    format!("{} sticker ({})", emoji, se)
+                }
                 "file" => msg
                     .file_name
                     .as_ref()
@@ -804,6 +871,7 @@ impl App {
             };
             parts.push(text(detail).size(12).into());
         }
+
 
         if !mentions.is_empty() {
             parts.push(
