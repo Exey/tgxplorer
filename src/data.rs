@@ -28,9 +28,95 @@ pub struct Message {
     pub edited_unixtime: Option<String>,
     #[serde(default)]
     pub file_name: Option<String>,
+    // Media fields
+    #[serde(default)]
+    pub photo: Option<String>,
+    #[serde(default)]
+    pub media_type: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub sticker_emoji: Option<String>,
+    #[serde(default)]
+    pub duration_seconds: Option<i64>,
     /// Keep any extra fields around.
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+impl Message {
+    /// Determine content-type tag for this message.
+    pub fn content_tag(&self) -> Option<&'static str> {
+        if self.photo.is_some() && self.media_type.is_none() {
+            return Some("image");
+        }
+        if let Some(ref mt) = self.media_type {
+            match mt.as_str() {
+                "sticker" => return Some("sticker"),
+                "voice_message" => return Some("voice"),
+                "video_message" => return Some("video_circle"),
+                "video_file" => return Some("video"),
+                "audio_file" => return Some("audio"),
+                "animation" => return Some("animation"),
+                _ => {}
+            }
+        }
+        if let Some(ref mime) = self.mime_type {
+            if mime.starts_with("image/") {
+                return Some("image");
+            }
+            if mime.starts_with("video/") {
+                return Some("video");
+            }
+        }
+        if self.file_name.is_some() {
+            return Some("file");
+        }
+        // Check for links in text entities
+        if self
+            .text_entities
+            .iter()
+            .any(|e| e.entity_type == "link" || e.entity_type == "text_link")
+        {
+            return Some("link");
+        }
+        None
+    }
+}
+
+/// Stats counters for content types.
+#[derive(Debug, Clone, Default)]
+pub struct ContentStats {
+    pub links: usize,
+    pub images: usize,
+    pub videos: usize,
+    pub files: usize,
+    pub stickers: usize,
+    pub voice: usize,
+    pub video_circles: usize,
+    pub reposts: usize,
+}
+
+impl ContentStats {
+    pub fn from_messages(messages: &HashMap<String, Message>) -> Self {
+        let mut stats = Self::default();
+        for msg in messages.values() {
+            if msg.forwarded_from.is_some() {
+                stats.reposts += 1;
+            }
+            match msg.content_tag() {
+                Some("link") => stats.links += 1,
+                Some("image") => stats.images += 1,
+                Some("video") => stats.videos += 1,
+                Some("file") => stats.files += 1,
+                Some("sticker") => stats.stickers += 1,
+                Some("voice") => stats.voice += 1,
+                Some("video_circle") => stats.video_circles += 1,
+                _ => {}
+            }
+        }
+        stats
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +141,7 @@ pub struct TelegramExport {
 // Hashing helpers
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub fn calc_message_key(msg: &Message) -> String {
     let te_prefix: String = serde_json::to_string(&msg.text_entities)
         .unwrap_or_default()
@@ -76,10 +163,12 @@ pub fn calc_message_key(msg: &Message) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[allow(dead_code)]
 pub fn calc_chain_id(chain: &[Message]) -> String {
     calc_message_key(&chain[0])
 }
 
+#[allow(dead_code)]
 pub fn calc_chat_id(messages: &HashMap<String, Message>) -> String {
     let first = messages
         .values()

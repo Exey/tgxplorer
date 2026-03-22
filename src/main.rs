@@ -1,43 +1,106 @@
 mod data;
 
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use data::{
-    filter_messages, find_all_chains, load_chat_history, parse_date, Message,
+    filter_messages, find_all_chains, load_chat_history, parse_date, ContentStats, Message,
 };
 use iced::widget::{
-    button, column, container, horizontal_rule, horizontal_space, pick_list, row, scrollable,
-    text, text_input, Column,
+    button, column, container, pick_list, row, scrollable, text,
+    text_input, Column,
 };
-use iced::{Element, Length, Task, Theme};
-use std::collections::HashMap;
+use iced::widget::rule;
+use iced::widget::space;
+use iced::widget::text::Wrapping;
+use iced::{clipboard, Element, Length, Task, Theme};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 fn main() -> iced::Result {
-    iced::application("tgxplorer", App::update, App::view)
+    iced::application(App::boot, App::update, App::view)
         .theme(App::theme)
         .window_size((1100.0, 700.0))
-        .run_with(App::new)
+        .run()
 }
 
 // ---------------------------------------------------------------------------
-// Application state
+// View modes — radio-button toggle, only one active
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    All,
+    Month,
+    Week,
+    ThreeDays,
+    Day,
+    SixHours,
+    ThreeHours,
+    OneHour,
+    Chains,
+}
+
+impl ViewMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "ALL",
+            Self::Month => "MNTH",
+            Self::Week => "WEEK",
+            Self::ThreeDays => "3DAYS",
+            Self::Day => "DAY",
+            Self::SixHours => "6HRS",
+            Self::ThreeHours => "3HRS",
+            Self::OneHour => "1HRS",
+            Self::Chains => "CHAINS",
+        }
+    }
+    const ORDERED: &'static [Self] = &[
+        Self::All,
+        Self::Month,
+        Self::Week,
+        Self::ThreeDays,
+        Self::Day,
+        Self::SixHours,
+        Self::ThreeHours,
+        Self::OneHour,
+        Self::Chains,
+    ];
+}
+
+// ---------------------------------------------------------------------------
+// State
 // ---------------------------------------------------------------------------
 
 struct App {
-    // Data
     file_path: Option<PathBuf>,
     chat_name: Option<String>,
     messages: HashMap<String, Message>,
     all_chains: Vec<Vec<Message>>,
     selected_chain: Option<usize>,
-    // Filters
+    sorted_messages: Vec<Message>,
+    content_stats: ContentStats,
+    view_mode: ViewMode,
+    time_groups: Vec<TimeGroup>,
+    expanded_groups: HashSet<String>,
     search_query: String,
     search_active: bool,
     min_chain_length: usize,
-    min_chain_input: String,
-    // Theme
     current_theme: Theme,
     theme_name: ThemeName,
 }
+
+#[derive(Debug, Clone)]
+struct TimeGroup {
+    key: String,
+    label: String,
+    chain_indices: Vec<usize>,
+    message_indices: Vec<usize>,
+    #[allow(dead_code)]
+    message_count: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThemeName {
@@ -80,7 +143,6 @@ impl ThemeName {
         Self::TokyoNight,
         Self::Oxocarbon,
     ];
-
     fn to_theme(self) -> Theme {
         match self {
             Self::Dark => Theme::Dark,
@@ -97,7 +159,7 @@ impl ThemeName {
 }
 
 // ---------------------------------------------------------------------------
-// Messages
+// Msg
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -105,39 +167,61 @@ enum Msg {
     OpenFile,
     FileOpened(Option<PathBuf>),
     SelectChain(usize),
+    SelectGroup(String),
+    ToggleGroup(String),
+    SetViewMode(ViewMode),
     SearchChanged(String),
     ToggleSearch,
     ThemeSelected(ThemeName),
-    MinChainChanged(String),
-    ApplyMinChain,
+    CopyText(String),
 }
 
+// ---------------------------------------------------------------------------
+// Helpers for content tags shown in message view
+// ---------------------------------------------------------------------------
+
+fn content_tag_emoji(tag: &str) -> &'static str {
+    match tag {
+        "link" => "🔗",
+        "image" => "🖼️",
+        "video" => "📹",
+        "file" => "📎",
+        "sticker" => "🔰",
+        "voice" => "🎤",
+        "video_circle" => "⭕",
+        "audio" => "🎵",
+        "animation" => "🎞️",
+        _ => "❓",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+
 impl App {
-    fn new() -> (Self, Task<Msg>) {
+    fn boot() -> (Self, Task<Msg>) {
         let mut app = Self {
             file_path: None,
             chat_name: None,
             messages: HashMap::new(),
             all_chains: Vec::new(),
             selected_chain: None,
+            sorted_messages: Vec::new(),
+            content_stats: ContentStats::default(),
+            view_mode: ViewMode::Chains,
+            time_groups: Vec::new(),
+            expanded_groups: HashSet::new(),
             search_query: String::new(),
             search_active: false,
             min_chain_length: 2,
-            min_chain_input: "2".into(),
             current_theme: Theme::Dark,
             theme_name: ThemeName::Dark,
         };
-
-        // Check CLI arg
-        let task = if let Some(path) = std::env::args().nth(1) {
-            let p = PathBuf::from(path);
-            app.load_file(&p);
-            Task::none()
-        } else {
-            Task::none()
-        };
-
-        (app, task)
+        if let Some(path) = std::env::args().nth(1) {
+            app.load_file(&PathBuf::from(path));
+        }
+        (app, Task::none())
     }
 
     fn load_file(&mut self, path: &PathBuf) {
@@ -150,8 +234,13 @@ impl App {
         let filtered = filter_messages(&dict, start, end, None);
         let chains = find_all_chains(&filtered, &dict, self.min_chain_length);
 
+        let mut sorted: Vec<Message> = dict.values().cloned().collect();
+        sorted.sort_by(|a, b| b.id.cmp(&a.id));
+
+        self.content_stats = ContentStats::from_messages(&dict);
         self.messages = dict;
         self.all_chains = chains;
+        self.sorted_messages = sorted;
         self.selected_chain = if self.all_chains.is_empty() {
             None
         } else {
@@ -159,8 +248,10 @@ impl App {
         };
         self.search_active = false;
         self.search_query.clear();
+        self.rebuild_time_groups();
     }
 
+    #[allow(dead_code)]
     fn rebuild_chains(&mut self) {
         let start = parse_date("1970-01-01").unwrap();
         let end = chrono::Local::now().naive_local();
@@ -171,11 +262,157 @@ impl App {
         } else {
             Some(0)
         };
+        self.rebuild_time_groups();
     }
 
-    fn visible_chains(&self) -> Vec<(usize, &Vec<Message>)> {
+    // -- time groups --
+
+    fn rebuild_time_groups(&mut self) {
+        self.time_groups.clear();
+        match self.view_mode {
+            ViewMode::All => {}
+            ViewMode::Chains => self.build_chain_groups(),
+            _ => self.build_message_time_groups(),
+        }
+    }
+
+    fn build_chain_groups(&mut self) {
+        let visible = self.visible_chain_indices();
+        let mut by_day: BTreeMap<NaiveDate, Vec<(usize, NaiveDateTime, usize)>> = BTreeMap::new();
+        for idx in &visible {
+            let chain = &self.all_chains[*idx];
+            if let Some(dt) = parse_date(&chain[0].date) {
+                by_day
+                    .entry(dt.date())
+                    .or_default()
+                    .push((*idx, dt, chain.len()));
+            }
+        }
+        for (day, mut entries) in by_day.into_iter().rev() {
+            entries.sort_by_key(|(_, dt, _)| *dt);
+            let total_msgs: usize = entries.iter().map(|(_, _, c)| c).sum();
+            let chain_indices: Vec<usize> = entries.iter().map(|(i, _, _)| *i).collect();
+            self.time_groups.push(TimeGroup {
+                key: day.format("%Y-%m-%d").to_string(),
+                label: format!(
+                    "{} — {} msgs, {} chains",
+                    day.format("%Y-%m-%d"),
+                    total_msgs,
+                    chain_indices.len()
+                ),
+                chain_indices,
+                message_indices: Vec::new(),
+                message_count: total_msgs,
+            });
+        }
+    }
+
+    fn build_message_time_groups(&mut self) {
+        let visible = self.visible_message_indices();
+        let mut buckets: BTreeMap<String, (String, Vec<usize>, usize)> = BTreeMap::new();
+        for idx in visible {
+            let msg = &self.sorted_messages[idx];
+            let dt = match parse_date(&msg.date) {
+                Some(d) => d,
+                None => continue,
+            };
+            let (key, label) = self.bucket_key_label(dt);
+            let entry = buckets
+                .entry(key)
+                .or_insert_with(|| (label, Vec::new(), 0));
+            entry.1.push(idx);
+            entry.2 += 1;
+        }
+        let mut keys: Vec<String> = buckets.keys().cloned().collect();
+        keys.sort();
+        keys.reverse();
+        for k in keys {
+            let (label, message_indices, message_count) = buckets.remove(&k).unwrap();
+            self.time_groups.push(TimeGroup {
+                key: k,
+                label: format!("{} — {} msgs", label, message_count),
+                chain_indices: Vec::new(),
+                message_indices,
+                message_count,
+            });
+        }
+    }
+
+    fn bucket_key_label(&self, dt: NaiveDateTime) -> (String, String) {
+        match self.view_mode {
+            ViewMode::Month => {
+                let key = dt.format("%Y-%m").to_string();
+                let label = dt.format("%Y %B").to_string();
+                (key, label)
+            }
+            ViewMode::Week => {
+                let iso = dt.date().iso_week();
+                let key = format!("{}-W{:02}", iso.year(), iso.week());
+                let label = format!("{} Week {}", iso.year(), iso.week());
+                (key, label)
+            }
+            ViewMode::ThreeDays => {
+                let day = dt.date();
+                let bucket = day.ordinal0() / 3;
+                let start_ord = bucket * 3;
+                let start = NaiveDate::from_yo_opt(day.year(), start_ord + 1).unwrap_or(day);
+                let end = NaiveDate::from_yo_opt(day.year(), start_ord + 3).unwrap_or(start);
+                let key = format!("{}-{:03}", day.year(), bucket);
+                let label = format!("{} – {}", start.format("%Y-%m-%d"), end.format("%m-%d"));
+                (key, label)
+            }
+            ViewMode::Day => {
+                let key = dt.format("%Y-%m-%d").to_string();
+                let label = dt.format("%Y-%m-%d %a").to_string();
+                (key, label)
+            }
+            ViewMode::SixHours => {
+                let slot = dt.hour() / 6;
+                let (h0, h1) = (slot * 6, slot * 6 + 6);
+                let key = format!("{}-{:02}", dt.format("%Y-%m-%d"), slot);
+                let label = format!("{} {:02}:00–{:02}:00", dt.format("%Y-%m-%d"), h0, h1);
+                (key, label)
+            }
+            ViewMode::ThreeHours => {
+                let slot = dt.hour() / 3;
+                let (h0, h1) = (slot * 3, slot * 3 + 3);
+                let key = format!("{}-{:02}", dt.format("%Y-%m-%d"), slot);
+                let label = format!("{} {:02}:00–{:02}:00", dt.format("%Y-%m-%d"), h0, h1);
+                (key, label)
+            }
+            ViewMode::OneHour => {
+                let h = dt.hour();
+                let key = format!("{}-{:02}", dt.format("%Y-%m-%d"), h);
+                let label = format!("{} {:02}:00–{:02}:00", dt.format("%Y-%m-%d"), h, h + 1);
+                (key, label)
+            }
+            _ => {
+                let key = dt.format("%Y-%m-%d").to_string();
+                (key.clone(), key)
+            }
+        }
+    }
+
+    fn visible_message_indices(&self) -> Vec<usize> {
         if !self.search_active || self.search_query.is_empty() {
-            return self.all_chains.iter().enumerate().collect();
+            return (0..self.sorted_messages.len()).collect();
+        }
+        let q = self.search_query.to_lowercase();
+        self.sorted_messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.text_entities
+                    .iter()
+                    .any(|e| e.text.to_lowercase().contains(&q))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn visible_chain_indices(&self) -> Vec<usize> {
+        if !self.search_active || self.search_query.is_empty() {
+            return (0..self.all_chains.len()).collect();
         }
         let q = self.search_query.to_lowercase();
         self.all_chains
@@ -188,6 +425,7 @@ impl App {
                         .any(|e| e.text.to_lowercase().contains(&q))
                 })
             })
+            .map(|(i, _)| i)
             .collect()
     }
 
@@ -195,9 +433,7 @@ impl App {
         self.current_theme.clone()
     }
 
-    // -----------------------------------------------------------------------
-    // Update
-    // -----------------------------------------------------------------------
+    // -- update --
 
     fn update(&mut self, message: Msg) -> Task<Msg> {
         match message {
@@ -213,31 +449,40 @@ impl App {
                     Msg::FileOpened,
                 );
             }
-            Msg::FileOpened(Some(path)) => {
-                self.load_file(&path);
-            }
+            Msg::FileOpened(Some(path)) => self.load_file(&path),
             Msg::FileOpened(None) => {}
             Msg::SelectChain(i) => {
                 self.selected_chain = Some(i);
+            }
+            Msg::SelectGroup(key) => {
+                self.expanded_groups.clear();
+                self.expanded_groups.insert(key);
+                self.selected_chain = None;
+            }
+            Msg::ToggleGroup(key) => {
+                if !self.expanded_groups.remove(&key) {
+                    self.expanded_groups.insert(key);
+                }
+            }
+            Msg::SetViewMode(mode) => {
+                self.view_mode = mode;
+                self.expanded_groups.clear();
+                self.selected_chain = None;
+                self.rebuild_time_groups();
             }
             Msg::SearchChanged(q) => {
                 self.search_query = q;
             }
             Msg::ToggleSearch => {
                 self.search_active = !self.search_active;
+                self.rebuild_time_groups();
             }
             Msg::ThemeSelected(name) => {
                 self.theme_name = name;
                 self.current_theme = name.to_theme();
             }
-            Msg::MinChainChanged(s) => {
-                self.min_chain_input = s;
-            }
-            Msg::ApplyMinChain => {
-                if let Ok(n) = self.min_chain_input.parse::<usize>() {
-                    self.min_chain_length = n.max(1);
-                    self.rebuild_chains();
-                }
+            Msg::CopyText(s) => {
+                return clipboard::write(s);
             }
         }
         Task::none()
@@ -247,9 +492,9 @@ impl App {
     // View
     // -----------------------------------------------------------------------
 
-    fn view(&self) -> Element<Msg> {
+    fn view(&self) -> Element<'_, Msg> {
         let toolbar = self.view_toolbar();
-        let content = if self.all_chains.is_empty() {
+        let content = if self.messages.is_empty() {
             self.view_empty()
         } else {
             self.view_main()
@@ -257,61 +502,74 @@ impl App {
         column![toolbar, content].spacing(0).into()
     }
 
-    fn view_toolbar(&self) -> Element<Msg> {
+    fn view_toolbar(&self) -> Element<'_, Msg> {
         let open_btn = button("Open JSON…").on_press(Msg::OpenFile).padding(6);
 
-        let title_text = match &self.chat_name {
-            Some(n) => text(format!("  {}  ", n)).size(16),
-            None => text("  tgxplorer  ").size(16),
+        let title_text: Element<'_, Msg> = match &self.chat_name {
+            Some(n) => text(format!("  {}  ", n)).size(16).into(),
+            None => text("  tgxplorer  ").size(16).into(),
         };
 
-        let chain_count = text(format!(
-            "Chains: {}",
-            self.visible_chains().len()
-        ))
-        .size(14);
+        // Emoji stats chips (only when data loaded)
+        let stats_row: Element<'_, Msg> = if !self.messages.is_empty() {
+            let s = &self.content_stats;
+            let mut chips: Vec<Element<'_, Msg>> = Vec::new();
+            let pairs: &[(&str, usize)] = &[
+                ("🔗", s.links),
+                ("🖼️", s.images),
+                ("📹", s.videos),
+                ("📎", s.files),
+                ("🔰", s.stickers),
+                ("🎤", s.voice),
+                ("⭕", s.video_circles),
+                ("🔁", s.reposts),
+            ];
+            for &(emoji, count) in pairs {
+                if count > 0 {
+                    chips.push(
+                        text(format!("{}{}", emoji, count))
+                            .size(12)
+                            .into(),
+                    );
+                }
+            }
+            row(chips).spacing(8).into()
+        } else {
+            text("").into()
+        };
 
+        // Search
         let search_input = text_input("Search…", &self.search_query)
             .on_input(Msg::SearchChanged)
             .on_submit(Msg::ToggleSearch)
             .width(180)
             .padding(5);
 
-        let search_btn = button(if self.search_active { "✕" } else { "⌕" })
-            .on_press(Msg::ToggleSearch)
-            .padding(6);
-
-        let theme_pick = pick_list(
-            ThemeName::ALL,
-            Some(self.theme_name),
-            Msg::ThemeSelected,
+        let search_btn = button(
+            text(if self.search_active { "Clear" } else { "Search" }).size(13),
         )
-        .padding(4);
+        .on_press(Msg::ToggleSearch)
+        .padding(6);
 
-        let min_input = text_input("min", &self.min_chain_input)
-            .on_input(Msg::MinChainChanged)
-            .on_submit(Msg::ApplyMinChain)
-            .width(50)
-            .padding(5);
-        let min_label = text("Min chain:").size(13);
+        let theme_pick =
+            pick_list(ThemeName::ALL, Some(self.theme_name), Msg::ThemeSelected).padding(4);
 
         let tb = row![
             open_btn,
             title_text,
-            horizontal_space(),
-            chain_count,
-            row![min_label, min_input].spacing(4).align_y(iced::Alignment::Center),
+            stats_row,
+            space::horizontal(),
             row![search_input, search_btn].spacing(4),
             theme_pick,
         ]
-        .spacing(12)
+        .spacing(10)
         .padding(8)
         .align_y(iced::Alignment::Center);
 
         container(tb).width(Length::Fill).into()
     }
 
-    fn view_empty(&self) -> Element<Msg> {
+    fn view_empty(&self) -> Element<'_, Msg> {
         let msg = column![
             text("tgxplorer").size(32),
             text("Telegram Exported Chat Explorer").size(16),
@@ -331,86 +589,174 @@ impl App {
             .into()
     }
 
-    fn view_main(&self) -> Element<Msg> {
-        let visible = self.visible_chains();
-
-        // Chain list (left panel)
-        let chain_items: Vec<Element<Msg>> = visible
+    fn view_main(&self) -> Element<'_, Msg> {
+        // Mode toggle bar
+        let mode_buttons: Vec<Element<'_, Msg>> = ViewMode::ORDERED
             .iter()
-            .map(|(real_idx, chain)| {
-                let first = &chain[0];
-                let dt = parse_date(&first.date)
-                    .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_else(|| first.date.clone());
-                let label = format!("({}) {}", chain.len(), dt);
-                let is_selected = self.selected_chain == Some(*real_idx);
-                let btn = button(text(label).size(13))
-                    .on_press(Msg::SelectChain(*real_idx))
-                    .width(Length::Fill)
-                    .padding(6)
-                    .style(if is_selected {
+            .map(|&mode| {
+                let active = self.view_mode == mode;
+                button(text(mode.label()).size(12))
+                    .on_press(Msg::SetViewMode(mode))
+                    .padding([3, 8])
+                    .style(if active {
                         button::primary
                     } else {
                         button::secondary
-                    });
-                btn.into()
+                    })
+                    .into()
             })
             .collect();
+        let mode_bar = row(mode_buttons)
+            .spacing(3)
+            .padding([4, 6])
+            .align_y(iced::Alignment::Center);
 
-        let chain_list = scrollable(
-            Column::with_children(chain_items).spacing(2).width(280),
-        )
-        .height(Length::Fill);
-
-        // Message detail (right panel)
-        let detail = if let Some(idx) = self.selected_chain {
-            if idx < self.all_chains.len() {
-                self.view_chain(&self.all_chains[idx])
-            } else {
-                column![text("No chain selected")].into()
-            }
-        } else {
-            column![text("Select a chain from the list")].into()
-        };
-
+        let sidebar = self.view_sidebar();
+        let detail = self.view_detail();
         let detail_scroll = scrollable(container(detail).padding(10)).height(Length::Fill);
 
-        row![
-            container(chain_list).padding(6),
+        let body = row![
+            container(sidebar).padding(6).width(340),
             container(detail_scroll).width(Length::Fill),
         ]
         .spacing(4)
-        .height(Length::Fill)
-        .into()
+        .height(Length::Fill);
+
+        column![mode_bar, body].spacing(2).into()
+    }
+
+    fn view_sidebar(&self) -> Element<'_, Msg> {
+        if self.view_mode == ViewMode::All {
+            let info = column![
+                text("Showing all messages").size(13),
+                text(format!("{} total", self.sorted_messages.len())).size(12),
+            ]
+            .spacing(4)
+            .padding(8);
+            return scrollable(info).height(Length::Fill).into();
+        }
+
+        let mut items: Vec<Element<'_, Msg>> = Vec::new();
+        for group in &self.time_groups {
+            let expanded = self.expanded_groups.contains(&group.key);
+            let arrow = if expanded { "▼" } else { "▶" };
+            let group_btn = button(text(format!("{} {}", arrow, group.label)).size(12))
+                .on_press(if self.view_mode == ViewMode::Chains {
+                    Msg::ToggleGroup(group.key.clone())
+                } else {
+                    Msg::SelectGroup(group.key.clone())
+                })
+                .width(Length::Fill)
+                .padding([4, 6])
+                .style(if expanded && self.view_mode != ViewMode::Chains {
+                    button::primary
+                } else {
+                    button::text
+                });
+            items.push(group_btn.into());
+
+            if self.view_mode == ViewMode::Chains && expanded {
+                for &ci in &group.chain_indices {
+                    let chain = &self.all_chains[ci];
+                    let first = &chain[0];
+                    let ts = parse_date(&first.date)
+                        .map(|d| d.format("%H:%M").to_string())
+                        .unwrap_or_default();
+                    let sender = first.from.as_deref().unwrap_or("");
+                    let preview: String = first
+                        .text_entities
+                        .iter()
+                        .filter(|e| e.entity_type == "plain")
+                        .flat_map(|e| e.text.chars())
+                        .take(28)
+                        .collect();
+                    let label = format!("  {} {} {}…", ts, sender, preview);
+                    let selected = self.selected_chain == Some(ci);
+                    items.push(
+                        button(text(label).size(11))
+                            .on_press(Msg::SelectChain(ci))
+                            .width(Length::Fill)
+                            .padding([2, 16])
+                            .style(if selected {
+                                button::primary
+                            } else {
+                                button::secondary
+                            })
+                            .into(),
+                    );
+                }
+            }
+        }
+        scrollable(Column::with_children(items).spacing(1).width(Length::Fill))
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn view_detail(&self) -> Element<'_, Msg> {
+        match self.view_mode {
+            ViewMode::All => {
+                let indices = self.visible_message_indices();
+                if indices.is_empty() {
+                    return column![text("No messages")].into();
+                }
+                let items: Vec<Element<'_, Msg>> = indices
+                    .iter()
+                    .take(2000)
+                    .map(|&i| self.view_message(&self.sorted_messages[i]))
+                    .collect();
+                Column::with_children(items)
+                    .spacing(4)
+                    .width(Length::Fill)
+                    .into()
+            }
+            ViewMode::Chains => {
+                if let Some(idx) = self.selected_chain {
+                    if idx < self.all_chains.len() {
+                        return self.view_chain(&self.all_chains[idx]);
+                    }
+                }
+                column![text("Select a chain from the list")].into()
+            }
+            _ => {
+                if let Some(key) = self.expanded_groups.iter().next() {
+                    if let Some(group) = self.time_groups.iter().find(|g| &g.key == key) {
+                        let items: Vec<Element<'_, Msg>> = group
+                            .message_indices
+                            .iter()
+                            .take(2000)
+                            .map(|&i| self.view_message(&self.sorted_messages[i]))
+                            .collect();
+                        return Column::with_children(items)
+                            .spacing(4)
+                            .width(Length::Fill)
+                            .into();
+                    }
+                }
+                column![text("Select a time group from the sidebar")].into()
+            }
+        }
     }
 
     fn view_chain<'a>(&'a self, chain: &'a [Message]) -> Element<'a, Msg> {
-        let q = if self.search_active {
-            Some(self.search_query.to_lowercase())
-        } else {
-            None
-        };
-
-        let msgs: Vec<Element<Msg>> = chain
-            .iter()
-            .map(|msg| self.view_message(msg, q.as_deref()))
-            .collect();
-
-        Column::with_children(msgs).spacing(4).width(Length::Fill).into()
+        let msgs: Vec<Element<'_, Msg>> = chain.iter().map(|m| self.view_message(m)).collect();
+        Column::with_children(msgs)
+            .spacing(4)
+            .width(Length::Fill)
+            .into()
     }
 
-    fn view_message<'a>(&'a self, msg: &'a Message, _search: Option<&str>) -> Element<'a, Msg> {
+    fn view_message<'a>(&'a self, msg: &'a Message) -> Element<'a, Msg> {
         let sender = msg.from.as_deref().unwrap_or("Unknown");
         let fwd = msg
             .forwarded_from
             .as_ref()
             .map(|f| format!(" (fwd: {})", f))
             .unwrap_or_default();
-
         let dt = parse_date(&msg.date)
             .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|| msg.date.clone());
 
+        // Collect text
         let plain: String = msg
             .text_entities
             .iter()
@@ -422,7 +768,7 @@ impl App {
         let links: Vec<&str> = msg
             .text_entities
             .iter()
-            .filter(|e| e.entity_type == "link")
+            .filter(|e| e.entity_type == "link" || e.entity_type == "text_link")
             .map(|e| e.text.as_str())
             .collect();
 
@@ -433,24 +779,69 @@ impl App {
             .map(|e| e.text.as_str())
             .collect();
 
-        let mut parts: Vec<Element<Msg>> = vec![
-            horizontal_rule(1).into(),
+        // -- Build parts --
+
+        let mut parts: Vec<Element<'_, Msg>> = vec![
+            rule::horizontal(1).into(),
             row![
                 text(format!("{}{}", sender, fwd)).size(14),
-                horizontal_space(),
-                text(dt.clone()).size(12),
+                space::horizontal(),
+                text(dt).size(12),
             ]
             .into(),
         ];
 
+        // Content type tag: [image], [video], [file <name>], [sticker], etc.
+        if let Some(tag) = msg.content_tag() {
+            let emoji = content_tag_emoji(tag);
+            let detail = match tag {
+                "file" => msg
+                    .file_name
+                    .as_ref()
+                    .map(|f| format!("{} {}", emoji, f))
+                    .unwrap_or_else(|| format!("{} file", emoji)),
+                _ => format!("{} {}", emoji, tag),
+            };
+            parts.push(text(detail).size(12).into());
+        }
+
         if !mentions.is_empty() {
-            parts.push(text(format!("Mentions: {}", mentions.join(", "))).size(12).into());
+            parts.push(
+                text(format!("Mentions: {}", mentions.join(", ")))
+                    .size(12)
+                    .into(),
+            );
         }
-        if !links.is_empty() {
-            parts.push(text(format!("Links: {}", links.join(" "))).size(12).into());
+
+        // Links — each with a small copy button
+        for url in &links {
+            let link_row = row![
+                text(format!("🔗 {}", url))
+                    .size(12)
+                    .wrapping(Wrapping::Word),
+                button(text("⎘").size(11))
+                    .on_press(Msg::CopyText(url.to_string()))
+                    .padding([1, 4])
+                    .style(button::text),
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center);
+            parts.push(link_row.into());
         }
+
+        // Message body — wrapping text + copy button
         if !plain.is_empty() {
-            parts.push(text(plain.clone()).size(14).into());
+            let body_text = text(plain.clone()).size(14).wrapping(Wrapping::Word);
+            let copy_btn = button(text("⎘").size(12))
+                .on_press(Msg::CopyText(plain))
+                .padding([2, 6])
+                .style(button::text);
+            parts.push(
+                row![container(body_text).width(Length::Fill), copy_btn]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Start)
+                    .into(),
+            );
         }
 
         Column::with_children(parts)
