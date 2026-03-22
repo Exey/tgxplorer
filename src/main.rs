@@ -85,6 +85,8 @@ struct App {
     expanded_groups: HashSet<String>,
     search_query: String,
     search_active: bool,
+    context_window: usize,
+    context_input: String,
     min_chain_length: usize,
     current_theme: Theme,
     theme_name: ThemeName,
@@ -176,6 +178,7 @@ enum Msg {
     ToggleSearch,
     ThemeSelected(ThemeName),
     CopyText(String),
+    ContextChanged(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +277,8 @@ impl App {
             expanded_groups: HashSet::new(),
             search_query: String::new(),
             search_active: false,
+            context_window: 0,
+            context_input: "0".into(),
             min_chain_length: 2,
             current_theme: Theme::Dark,
             theme_name: ThemeName::Dark,
@@ -452,9 +457,10 @@ impl App {
         }
     }
 
-    fn visible_message_indices(&self) -> Vec<usize> {
+    /// Returns indices of messages that directly match the search query.
+    fn matched_message_indices(&self) -> HashSet<usize> {
         if !self.search_active || self.search_query.is_empty() {
-            return (0..self.sorted_messages.len()).collect();
+            return HashSet::new();
         }
         let q = self.search_query.to_lowercase();
         self.sorted_messages
@@ -467,6 +473,41 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Returns visible indices: matched messages + context window neighbors.
+    fn visible_message_indices(&self) -> Vec<usize> {
+        if !self.search_active || self.search_query.is_empty() {
+            return (0..self.sorted_messages.len()).collect();
+        }
+        let matched = self.matched_message_indices();
+        if matched.is_empty() {
+            return Vec::new();
+        }
+        if self.context_window == 0 {
+            let mut v: Vec<usize> = matched.into_iter().collect();
+            v.sort();
+            return v;
+        }
+        // Context window: N total context messages split before/after
+        // 1 -> 0 before, 1 after
+        // 2 -> 1 before, 1 after
+        // 3 -> 1 before, 2 after
+        // 4 -> 2 before, 2 after
+        let before = self.context_window / 2;
+        let after = self.context_window - before;
+        let len = self.sorted_messages.len();
+        let mut expanded: HashSet<usize> = HashSet::new();
+        for &idx in &matched {
+            let start = idx.saturating_sub(before);
+            let end = (idx + after + 1).min(len);
+            for i in start..end {
+                expanded.insert(i);
+            }
+        }
+        let mut v: Vec<usize> = expanded.into_iter().collect();
+        v.sort();
+        v
     }
 
     fn visible_chain_indices(&self) -> Vec<usize> {
@@ -543,6 +584,15 @@ impl App {
             Msg::CopyText(s) => {
                 return clipboard::write(s);
             }
+            Msg::ContextChanged(s) => {
+                self.context_input = s.clone();
+                if let Ok(n) = s.parse::<usize>() {
+                    self.context_window = n;
+                    if self.search_active {
+                        self.rebuild_time_groups();
+                    }
+                }
+            }
         }
         Task::none()
     }
@@ -613,12 +663,19 @@ impl App {
         let theme_pick =
             pick_list(ThemeName::ALL, Some(self.theme_name), Msg::ThemeSelected).padding(4);
 
+        let ctx_label = text("Context:").size(12);
+        let ctx_input = text_input("0", &self.context_input)
+            .on_input(Msg::ContextChanged)
+            .width(36)
+            .padding(5);
+
         let tb = row![
             open_btn,
             title_text,
             stats_row,
             space::horizontal(),
             row![search_input, search_btn].spacing(4),
+            row![ctx_label, ctx_input].spacing(3).align_y(iced::Alignment::Center),
             theme_pick,
         ]
         .spacing(10)
@@ -752,6 +809,7 @@ impl App {
     }
 
     fn view_detail(&self) -> Element<'_, Msg> {
+        let matched = self.matched_message_indices();
         match self.view_mode {
             ViewMode::All => {
                 let indices = self.visible_message_indices();
@@ -761,7 +819,7 @@ impl App {
                 let items: Vec<Element<'_, Msg>> = indices
                     .iter()
                     .take(2000)
-                    .map(|&i| self.view_message(&self.sorted_messages[i]))
+                    .map(|&i| self.view_message(&self.sorted_messages[i], matched.contains(&i)))
                     .collect();
                 Column::with_children(items)
                     .spacing(4)
@@ -783,7 +841,7 @@ impl App {
                             .message_indices
                             .iter()
                             .take(2000)
-                            .map(|&i| self.view_message(&self.sorted_messages[i]))
+                            .map(|&i| self.view_message(&self.sorted_messages[i], matched.contains(&i)))
                             .collect();
                         return Column::with_children(items)
                             .spacing(4)
@@ -797,14 +855,14 @@ impl App {
     }
 
     fn view_chain<'a>(&'a self, chain: &'a [Message]) -> Element<'a, Msg> {
-        let msgs: Vec<Element<'_, Msg>> = chain.iter().map(|m| self.view_message(m)).collect();
+        let msgs: Vec<Element<'_, Msg>> = chain.iter().map(|m| self.view_message(m, false)).collect();
         Column::with_children(msgs)
             .spacing(4)
             .width(Length::Fill)
             .into()
     }
 
-    fn view_message<'a>(&'a self, msg: &'a Message) -> Element<'a, Msg> {
+    fn view_message<'a>(&'a self, msg: &'a Message, highlight: bool) -> Element<'a, Msg> {
         let sender = msg.from.as_deref().unwrap_or("Unknown");
         let fwd = msg
             .forwarded_from
@@ -912,10 +970,26 @@ impl App {
             );
         }
 
-        Column::with_children(parts)
+        let msg_col = Column::with_children(parts)
             .spacing(3)
             .padding(6)
-            .width(Length::Fill)
-            .into()
+            .width(Length::Fill);
+
+        if highlight {
+            container(msg_col)
+                .width(Length::Fill)
+                .style(|_theme: &Theme| container::Style {
+                    background: Some(Color::from_rgba8(0xFF, 0xD9, 0x3D, 0.15).into()),
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        width: 0.0,
+                        color: Color::TRANSPARENT,
+                    },
+                    ..Default::default()
+                })
+                .into()
+        } else {
+            msg_col.into()
+        }
     }
 }
