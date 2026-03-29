@@ -300,7 +300,15 @@ impl App {
     }
 
     fn load_file(&mut self, path: &PathBuf) {
-        let (name, dict) = load_chat_history(path);
+        let result = load_chat_history(path);
+        let (name, dict) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error loading file: {}", e);
+                self.chat_name = Some(format!("Error: {}", e));
+                return;
+            }
+        };
         self.chat_name = name;
         self.file_path = Some(path.clone());
 
@@ -309,8 +317,13 @@ impl App {
         let filtered = filter_messages(&dict, start, end, None);
         let chains = find_all_chains(&filtered, &dict, self.min_chain_length);
 
-        let mut sorted: Vec<Message> = dict.values().cloned().collect();
-        sorted.sort_by(|a, b| a.id.cmp(&b.id)); // oldest first
+        // Build sorted index list (oldest first) instead of cloning all messages
+        let mut sorted_ids: Vec<i64> = dict.values().map(|m| m.id).collect();
+        sorted_ids.sort();
+        let sorted: Vec<Message> = sorted_ids
+            .iter()
+            .filter_map(|id| dict.get(&id.to_string()).cloned())
+            .collect();
 
         self.content_stats = ContentStats::from_messages(&dict);
 

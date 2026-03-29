@@ -1,7 +1,6 @@
 use chrono::NaiveDateTime;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -41,9 +40,6 @@ pub struct Message {
     pub sticker_emoji: Option<String>,
     #[serde(default)]
     pub duration_seconds: Option<i64>,
-    /// Keep any extra fields around.
-    #[serde(flatten)]
-    pub extra: HashMap<String, Value>,
 }
 
 impl Message {
@@ -183,16 +179,18 @@ pub fn calc_chat_id(messages: &HashMap<String, Message>) -> String {
 // Loading & filtering
 // ---------------------------------------------------------------------------
 
-pub fn load_chat_history(path: &Path) -> (Option<String>, HashMap<String, Message>) {
-    let data = fs::read_to_string(path).expect("cannot read file");
-    let export: TelegramExport = serde_json::from_str(&data).expect("invalid JSON");
+pub fn load_chat_history(path: &Path) -> Result<(Option<String>, HashMap<String, Message>), String> {
+    let file = fs::File::open(path).map_err(|e| format!("Cannot open file: {}", e))?;
+    let reader = std::io::BufReader::with_capacity(8 * 1024 * 1024, file); // 8MB buffer
+    let export: TelegramExport =
+        serde_json::from_reader(reader).map_err(|e| format!("Invalid JSON: {}", e))?;
     let name = export.name;
     let dict: HashMap<String, Message> = export
         .messages
         .into_iter()
         .map(|m| (m.id.to_string(), m))
         .collect();
-    (name, dict)
+    Ok((name, dict))
 }
 
 pub fn parse_date(s: &str) -> Option<NaiveDateTime> {
