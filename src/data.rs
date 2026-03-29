@@ -21,6 +21,8 @@ pub struct Message {
     #[serde(default)]
     pub forwarded_from: Option<String>,
     #[serde(default)]
+    pub forwarded_from_id: Option<String>,
+    #[serde(default)]
     pub reply_to_message_id: Option<i64>,
     #[serde(default)]
     pub text_entities: Vec<TextEntity>,

@@ -11,7 +11,8 @@ use iced::widget::{
 use iced::widget::rule;
 use iced::widget::space;
 use iced::widget::text::Wrapping;
-use iced::{clipboard, Color, Element, Length, Task, Theme};
+use iced::{clipboard, Color, Element, Length, Subscription, Task, Theme};
+use iced::{event, keyboard, Event};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -20,6 +21,7 @@ use std::path::PathBuf;
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
         .theme(App::theme)
+        .subscription(App::subscription)
         .window_size((1100.0, 700.0))
         .run()
 }
@@ -80,6 +82,8 @@ struct App {
     selected_chain: Option<usize>,
     sorted_messages: Vec<Message>,
     content_stats: ContentStats,
+    all_links: Vec<String>,
+    show_all_links: bool,
     view_mode: ViewMode,
     time_groups: Vec<TimeGroup>,
     expanded_groups: HashSet<String>,
@@ -178,7 +182,11 @@ enum Msg {
     ToggleSearch,
     ThemeSelected(ThemeName),
     CopyText(String),
+    OpenUrl(String),
     ContextChanged(String),
+    ToggleAllLinks,
+    NavUp,
+    NavDown,
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +280,8 @@ impl App {
             selected_chain: None,
             sorted_messages: Vec::new(),
             content_stats: ContentStats::default(),
+            all_links: Vec::new(),
+            show_all_links: false,
             view_mode: ViewMode::Chains,
             time_groups: Vec::new(),
             expanded_groups: HashSet::new(),
@@ -303,6 +313,21 @@ impl App {
         sorted.sort_by(|a, b| a.id.cmp(&b.id)); // oldest first
 
         self.content_stats = ContentStats::from_messages(&dict);
+
+        // Collect all unique links, sorted alphabetically
+        let mut all_links: Vec<String> = Vec::new();
+        for msg in dict.values() {
+            for e in &msg.text_entities {
+                if (e.entity_type == "link" || e.entity_type == "text_link") && !e.text.is_empty() {
+                    all_links.push(e.text.clone());
+                }
+            }
+        }
+        all_links.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        all_links.dedup();
+        self.all_links = all_links;
+        self.show_all_links = false;
+
         self.messages = dict;
         self.all_chains = chains;
         self.sorted_messages = sorted;
@@ -533,6 +558,25 @@ impl App {
         self.current_theme.clone()
     }
 
+    fn subscription(&self) -> Subscription<Msg> {
+        event::listen_with(|ev, status, _| {
+            if let event::Status::Captured = status {
+                return None;
+            }
+            match ev {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::ArrowUp),
+                    ..
+                }) => Some(Msg::NavUp),
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+                    ..
+                }) => Some(Msg::NavDown),
+                _ => None,
+            }
+        })
+    }
+
     // -- update --
 
     fn update(&mut self, message: Msg) -> Task<Msg> {
@@ -553,21 +597,25 @@ impl App {
             Msg::FileOpened(None) => {}
             Msg::SelectChain(i) => {
                 self.selected_chain = Some(i);
+                self.show_all_links = false;
             }
             Msg::SelectGroup(key) => {
                 self.expanded_groups.clear();
                 self.expanded_groups.insert(key);
                 self.selected_chain = None;
+                self.show_all_links = false;
             }
             Msg::ToggleGroup(key) => {
                 if !self.expanded_groups.remove(&key) {
                     self.expanded_groups.insert(key);
                 }
+                self.show_all_links = false;
             }
             Msg::SetViewMode(mode) => {
                 self.view_mode = mode;
                 self.expanded_groups.clear();
                 self.selected_chain = None;
+                self.show_all_links = false;
                 self.rebuild_time_groups();
             }
             Msg::SearchChanged(q) => {
@@ -590,6 +638,71 @@ impl App {
                     self.context_window = n;
                     if self.search_active {
                         self.rebuild_time_groups();
+                    }
+                }
+            }
+            Msg::ToggleAllLinks => {
+                self.show_all_links = !self.show_all_links;
+            }
+            Msg::OpenUrl(url) => {
+                #[cfg(target_os = "macos")]
+                { let _ = std::process::Command::new("open").arg(&url).spawn(); }
+                #[cfg(target_os = "linux")]
+                { let _ = std::process::Command::new("xdg-open").arg(&url).spawn(); }
+                #[cfg(target_os = "windows")]
+                { let _ = std::process::Command::new("cmd").args(["/C", "start", &url]).spawn(); }
+            }
+            Msg::NavUp => {
+                self.show_all_links = false;
+                match self.view_mode {
+                    ViewMode::Chains => {
+                        if let Some(idx) = self.selected_chain {
+                            if idx > 0 {
+                                self.selected_chain = Some(idx - 1);
+                            }
+                        }
+                    }
+                    _ => {
+                        // Navigate groups: find current expanded, move to previous
+                        if let Some(cur_key) = self.expanded_groups.iter().next().cloned() {
+                            if let Some(pos) = self.time_groups.iter().position(|g| g.key == cur_key) {
+                                if pos > 0 {
+                                    let new_key = self.time_groups[pos - 1].key.clone();
+                                    self.expanded_groups.clear();
+                                    self.expanded_groups.insert(new_key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Msg::NavDown => {
+                self.show_all_links = false;
+                match self.view_mode {
+                    ViewMode::Chains => {
+                        let max = self.all_chains.len().saturating_sub(1);
+                        if let Some(idx) = self.selected_chain {
+                            if idx < max {
+                                self.selected_chain = Some(idx + 1);
+                            }
+                        } else if !self.all_chains.is_empty() {
+                            self.selected_chain = Some(0);
+                        }
+                    }
+                    _ => {
+                        if let Some(cur_key) = self.expanded_groups.iter().next().cloned() {
+                            if let Some(pos) = self.time_groups.iter().position(|g| g.key == cur_key) {
+                                if pos + 1 < self.time_groups.len() {
+                                    let new_key = self.time_groups[pos + 1].key.clone();
+                                    self.expanded_groups.clear();
+                                    self.expanded_groups.insert(new_key);
+                                }
+                            }
+                        } else if !self.time_groups.is_empty() {
+                            let key = self.time_groups[0].key.clone();
+                            self.expanded_groups.clear();
+                            self.expanded_groups.insert(key);
+                        }
                     }
                 }
             }
@@ -623,8 +736,21 @@ impl App {
         let stats_row: Element<'_, Msg> = if !self.messages.is_empty() {
             let s = &self.content_stats;
             let mut chips: Vec<Element<'_, Msg>> = Vec::new();
-            let pairs: &[(&str, usize)] = &[
-                ("🔗", s.links),
+            // Links chip is a button
+            if s.links > 0 {
+                chips.push(
+                    button(text(format!("🔗{}", s.links)).size(12))
+                        .on_press(Msg::ToggleAllLinks)
+                        .padding([1, 4])
+                        .style(if self.show_all_links {
+                            button::primary
+                        } else {
+                            button::text
+                        })
+                        .into(),
+                );
+            }
+            let other_pairs: &[(&str, usize)] = &[
                 ("🖼️", s.images),
                 ("📹", s.videos),
                 ("📎", s.files),
@@ -633,7 +759,7 @@ impl App {
                 ("⭕", s.video_circles),
                 ("🔁", s.reposts),
             ];
-            for &(emoji, count) in pairs {
+            for &(emoji, count) in other_pairs {
                 if count > 0 {
                     chips.push(
                         text(format!("{}{}", emoji, count))
@@ -809,6 +935,52 @@ impl App {
     }
 
     fn view_detail(&self) -> Element<'_, Msg> {
+        // Show all links panel if toggled
+        if self.show_all_links {
+            let mut link_items: Vec<Element<'_, Msg>> = vec![
+                text(format!("All links ({})", self.all_links.len()))
+                    .size(16)
+                    .into(),
+                rule::horizontal(1).into(),
+            ];
+            for url in &self.all_links {
+                let full_url = if url.starts_with("http://") || url.starts_with("https://") {
+                    url.clone()
+                } else {
+                    format!("https://{}", url)
+                };
+                let link_row = row![
+                    text(format!("🔗 {}", url))
+                        .size(13)
+                        .wrapping(Wrapping::Word),
+                    button(text("⎘").size(11))
+                        .on_press(Msg::CopyText(url.clone()))
+                        .padding([1, 4])
+                        .style(button::text),
+                    button(text("↗").size(11))
+                        .on_press(Msg::OpenUrl(full_url))
+                        .padding([1, 4])
+                        .style(button::text),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center);
+                link_items.push(link_row.into());
+            }
+            // Copy all links button
+            let all_text = self.all_links.join("\n");
+            link_items.push(rule::horizontal(1).into());
+            link_items.push(
+                button(text("Copy all links").size(13))
+                    .on_press(Msg::CopyText(all_text))
+                    .padding(6)
+                    .into(),
+            );
+            return Column::with_children(link_items)
+                .spacing(3)
+                .width(Length::Fill)
+                .into();
+        }
+
         let matched = self.matched_message_indices();
         match self.view_mode {
             ViewMode::All => {
@@ -869,6 +1041,15 @@ impl App {
             .as_ref()
             .map(|f| format!(" (fwd: {})", f))
             .unwrap_or_default();
+        // Build tg:// link for forwarded user id
+        let fwd_tg_link: Option<String> = msg.forwarded_from_id.as_ref().and_then(|id| {
+            let numeric: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+            if numeric.is_empty() {
+                None
+            } else {
+                Some(format!("tg://user?id={}", numeric))
+            }
+        });
         let dt = parse_date(&msg.date)
             .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|| msg.date.clone());
@@ -912,6 +1093,24 @@ impl App {
         .align_y(iced::Alignment::Center);
         parts.push(header.into());
 
+        // Forwarded user tg:// link
+        if let Some(ref tg_link) = fwd_tg_link {
+            let fwd_row = row![
+                text(format!("↗ {}", tg_link)).size(11),
+                button(text("⎘").size(10))
+                    .on_press(Msg::CopyText(tg_link.clone()))
+                    .padding([1, 3])
+                    .style(button::text),
+                button(text("↗").size(10))
+                    .on_press(Msg::OpenUrl(tg_link.clone()))
+                    .padding([1, 3])
+                    .style(button::text),
+            ]
+            .spacing(3)
+            .align_y(iced::Alignment::Center);
+            parts.push(fwd_row.into());
+        }
+
         // Content type tag -- sticker shows emoji in brackets
         if let Some(tag) = msg.content_tag() {
             let emoji = content_tag_emoji(tag);
@@ -932,21 +1131,53 @@ impl App {
 
 
         if !mentions.is_empty() {
-            parts.push(
-                text(format!("Mentions: {}", mentions.join(", ")))
-                    .size(12)
+            let mut mention_items: Vec<Element<'_, Msg>> = vec![
+                text("Mentions:").size(12).into(),
+            ];
+            for m in &mentions {
+                mention_items.push(
+                    row![
+                        text(*m).size(12),
+                        button(text("⎘").size(10))
+                            .on_press(Msg::CopyText(m.to_string()))
+                            .padding([1, 3])
+                            .style(button::text),
+                    ]
+                    .spacing(2)
+                    .align_y(iced::Alignment::Center)
                     .into(),
-            );
+                );
+            }
+            if mentions.len() > 1 {
+                let all_mentions = mentions.iter().copied().collect::<Vec<_>>().join(" ");
+                mention_items.push(
+                    button(text("⎘ all").size(10))
+                        .on_press(Msg::CopyText(all_mentions))
+                        .padding([1, 4])
+                        .style(button::text)
+                        .into(),
+                );
+            }
+            parts.push(row(mention_items).spacing(4).align_y(iced::Alignment::Center).into());
         }
 
-        // Links — each with a small copy button
+        // Links — each with copy and open buttons
         for url in &links {
+            let full_url = if url.starts_with("http://") || url.starts_with("https://") {
+                url.to_string()
+            } else {
+                format!("https://{}", url)
+            };
             let link_row = row![
                 text(format!("🔗 {}", url))
                     .size(12)
                     .wrapping(Wrapping::Word),
                 button(text("⎘").size(11))
                     .on_press(Msg::CopyText(url.to_string()))
+                    .padding([1, 4])
+                    .style(button::text),
+                button(text("↗").size(11))
+                    .on_press(Msg::OpenUrl(full_url))
                     .padding([1, 4])
                     .style(button::text),
             ]
