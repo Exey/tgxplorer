@@ -16,6 +16,8 @@ Or open a file from the GUI:
 cargo run --release
 ```
 
+![UI](https://i.postimg.cc/q4GFr6FF/ttb-tgxplorer.png)
+
 ## Features
 
 - **View modes**: ALL, MNTH, WEEK, 3DAYS, DAY, 6HRS, 3HRS, 1HRS, CHAINS
