@@ -84,6 +84,7 @@ struct App {
     content_stats: ContentStats,
     all_links: Vec<String>,
     show_all_links: bool,
+    raw_json_view: Option<String>, // currently displayed raw JSON
     view_mode: ViewMode,
     time_groups: Vec<TimeGroup>,
     expanded_groups: HashSet<String>,
@@ -185,6 +186,8 @@ enum Msg {
     OpenUrl(String),
     ContextChanged(String),
     ToggleAllLinks,
+    ShowRawJson(i64),
+    CloseRawJson,
     NavUp,
     NavDown,
 }
@@ -282,6 +285,7 @@ impl App {
             content_stats: ContentStats::default(),
             all_links: Vec::new(),
             show_all_links: false,
+            raw_json_view: None,
             view_mode: ViewMode::Chains,
             time_groups: Vec::new(),
             expanded_groups: HashSet::new(),
@@ -611,12 +615,14 @@ impl App {
             Msg::SelectChain(i) => {
                 self.selected_chain = Some(i);
                 self.show_all_links = false;
+                self.raw_json_view = None;
             }
             Msg::SelectGroup(key) => {
                 self.expanded_groups.clear();
                 self.expanded_groups.insert(key);
                 self.selected_chain = None;
                 self.show_all_links = false;
+                self.raw_json_view = None;
             }
             Msg::ToggleGroup(key) => {
                 if !self.expanded_groups.remove(&key) {
@@ -656,6 +662,22 @@ impl App {
             }
             Msg::ToggleAllLinks => {
                 self.show_all_links = !self.show_all_links;
+                self.raw_json_view = None;
+            }
+            Msg::ShowRawJson(msg_id) => {
+                // Look up message by id and serialize to pretty JSON
+                let key = msg_id.to_string();
+                if let Some(msg) = self.messages.get(&key) {
+                    match serde_json::to_string_pretty(msg) {
+                        Ok(json) => self.raw_json_view = Some(json),
+                        Err(e) => self.raw_json_view = Some(format!("Error: {}", e)),
+                    }
+                } else {
+                    self.raw_json_view = Some(format!("Message {} not found", msg_id));
+                }
+            }
+            Msg::CloseRawJson => {
+                self.raw_json_view = None;
             }
             Msg::OpenUrl(url) => {
                 #[cfg(target_os = "macos")]
@@ -948,6 +970,42 @@ impl App {
     }
 
     fn view_detail(&self) -> Element<'_, Msg> {
+        // Show raw JSON panel if active
+        if let Some(ref json) = self.raw_json_view {
+            let mut json_items: Vec<Element<'_, Msg>> = vec![
+                row![
+                    text("Raw JSON").size(16),
+                    space::horizontal(),
+                    button(text("⎘ Copy").size(12))
+                        .on_press(Msg::CopyText(json.clone()))
+                        .padding([3, 8])
+                        .style(button::secondary),
+                    button(text("✕ Close").size(12))
+                        .on_press(Msg::CloseRawJson)
+                        .padding([3, 8])
+                        .style(button::secondary),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                .into(),
+                rule::horizontal(1).into(),
+            ];
+            // Render JSON lines with syntax-colored formatting
+            for line in json.lines() {
+                json_items.push(
+                    text(line.to_string())
+                        .size(13)
+                        .font(iced::Font::MONOSPACE)
+                        .wrapping(Wrapping::None)
+                        .into(),
+                );
+            }
+            return Column::with_children(json_items)
+                .spacing(1)
+                .width(Length::Fill)
+                .into();
+        }
+
         // Show all links panel if toggled
         if self.show_all_links {
             let mut link_items: Vec<Element<'_, Msg>> = vec![
@@ -1199,7 +1257,12 @@ impl App {
             parts.push(link_row.into());
         }
 
-        // Message body — wrapping text + copy button
+        // Message body — wrapping text + copy button + RAW button
+        let raw_btn = button(text("{ }").size(11))
+            .on_press(Msg::ShowRawJson(msg.id))
+            .padding([2, 6])
+            .style(button::text);
+
         if !plain.is_empty() {
             let body_text = text(plain.clone()).size(14).wrapping(Wrapping::Word);
             let copy_btn = button(text("⎘").size(12))
@@ -1207,11 +1270,14 @@ impl App {
                 .padding([2, 6])
                 .style(button::text);
             parts.push(
-                row![container(body_text).width(Length::Fill), copy_btn]
+                row![container(body_text).width(Length::Fill), copy_btn, raw_btn]
                     .spacing(4)
                     .align_y(iced::Alignment::Start)
                     .into(),
             );
+        } else {
+            // No body text, just show RAW button
+            parts.push(raw_btn.into());
         }
 
         let msg_col = Column::with_children(parts)
